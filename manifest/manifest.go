@@ -368,6 +368,11 @@ func (m *Manifest) ApplyRemoves() ([]*Project, error) {
 		case *RemoveProject:
 			targets, found := projects[ele.Name]
 			if !found {
+				if ele.IsOptional() {
+					// Like the repo tool: an optional remove-project may name a project
+					// that this manifest does not define.
+					continue
+				}
 				return nil, fmt.Errorf("encountered remove project without accompanying project for %q", ele.Name)
 			}
 			for _, tgt := range targets {

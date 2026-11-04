@@ -23,6 +23,7 @@ package manifest
 import (
 	"encoding/xml"
 	"regexp"
+	"strings"
 )
 
 // Copyfile indicates that a file should be copied in a checkout
@@ -122,6 +123,19 @@ type ManifestServer struct {
 type RemoveProject struct {
 	XMLName xml.Name `xml:"remove-project"`
 	Name    string   `xml:"name,attr" json:"name"`
+	// Optional is the optional attribute. The repo tool skips an optional remove-project
+	// that matches no project instead of failing.
+	Optional string `xml:"optional,attr,omitempty" json:"optional,omitempty"`
+}
+
+// IsOptional reports whether the optional attribute holds a true value, read like the
+// repo tool reads boolean attributes ("true", "yes" or "1").
+func (r *RemoveProject) IsOptional() bool {
+	switch strings.ToLower(r.Optional) {
+	case "true", "yes", "1":
+		return true
+	}
+	return false
 }
 
 type ExtendProject struct {

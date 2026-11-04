@@ -68,6 +68,86 @@ func TestRemoveProjects(t *testing.T) {
 	require.NoError(t, m.Validate())
 }
 
+func TestRemoveProjects_Optional(t *testing.T) {
+	// The first remove-project names a project the manifest never defines, as an adapter
+	// manifest does that is shared between products. The repo tool skips it because it is
+	// optional; the second one still removes its project.
+	in := `<manifest>
+ <remote name="aosp" fetch=".."></remote>
+ <project name="platform/build/soong" path="build/soong"></project>
+ <project name="device/vendor/board" path="device/vendor/board"></project>
+ <remove-project name="device/vendor/other-board" optional="true"></remove-project>
+ <remove-project name="device/vendor/board" optional="true"></remove-project>
+ <project name="platform/art" path="art"></project>
+</manifest>`
+
+	want := []*Project{
+		{
+			XMLName: xml.Name{Local: "project"},
+			Name:    "platform/build/soong",
+			Path:    "build/soong",
+		},
+		{
+			XMLName: xml.Name{Local: "project"},
+			Name:    "platform/art",
+			Path:    "art",
+		},
+	}
+	m, err := Parse([]byte(in))
+	require.NoError(t, err)
+	projects, err := m.ApplyRemoves()
+	require.NoError(t, err)
+	require.Equal(t, want, projects)
+	require.NoError(t, m.Validate())
+}
+
+func TestRemoveProjects_MissingProject(t *testing.T) {
+	tests := []struct {
+		attr    string
+		wantErr bool
+	}{
+		{attr: ``, wantErr: true},
+		{attr: ` optional="false"`, wantErr: true},
+		{attr: ` optional="true"`},
+		{attr: ` optional="yes"`},
+		{attr: ` optional="1"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.attr, func(t *testing.T) {
+			in := `<manifest>
+ <remote name="aosp" fetch=".."></remote>
+ <project name="platform/build/soong" path="build/soong"></project>
+ <remove-project name="device/vendor/other-board"` + tt.attr + `></remove-project>
+</manifest>`
+			m, err := Parse([]byte(in))
+			require.NoError(t, err)
+			projects, err := m.ApplyRemoves()
+			if tt.wantErr {
+				require.ErrorContains(t, err, "remove project without accompanying project")
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, projects, 1)
+		})
+	}
+}
+
+// The attribute is kept when a manifest is written out again, so the repo tool, which reads
+// the manifests ABFS writes, still skips the remove-project.
+func TestRemoveProjects_OptionalKeptOnMarshal(t *testing.T) {
+	in := `<manifest>
+ <remote name="aosp" fetch=".."></remote>
+ <project name="platform/build/soong" path="build/soong"></project>
+ <remove-project name="device/vendor/other-board" optional="true"></remove-project>
+</manifest>`
+
+	m, err := Parse([]byte(in))
+	require.NoError(t, err)
+	got, err := xml.MarshalIndent(m, "", " ")
+	require.NoError(t, err)
+	require.Equal(t, in, string(got))
+}
+
 // After cloning a manifest, the order of elements should be identical.
 func TestCloneOrder(t *testing.T) {
 	in := `<manifest>

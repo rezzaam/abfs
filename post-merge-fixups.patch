@@ -1,0 +1,149 @@
+diff --git a/abfs_test.go b/abfs_test.go
+index acc19ab..3a1f093 100644
+--- a/abfs_test.go
++++ b/abfs_test.go
+@@ -395,6 +395,8 @@ func TestCreateManifestProject_NoBranchUsesHead(t *testing.T) {
+ 		require.NotPanics(t, func() { _, _, err = testMountSetup(t, c, ABFSInfo{ManifestBytes: manifestBytes}) })
+ 		require.ErrorContains(t, err, "no branches")
+ 	})
++}
++
+ func TestNewCloneOptions_RefKey(t *testing.T) {
+ 	a := &ABFS{}
+ 	project := &manifest.Project{
+diff --git a/abfsrepo/refkey_test.go b/abfsrepo/refkey_test.go
+index ece6439..97be55e 100644
+--- a/abfsrepo/refkey_test.go
++++ b/abfsrepo/refkey_test.go
+@@ -19,6 +19,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"sync"
+ 	"testing"
+ 
+@@ -133,7 +134,15 @@ func TestSync_RefKey(t *testing.T) {
+ 			}))
+ 
+ 			require.Error(repo.Sync(ctx, nil, abfsrepo.SyncOpts{Jobs: 1, FallbackToGit: true}))
+-			require.Equal(tt.want, store.recorded())
++			// abfs repo sync also resolves the manifest revision (a local path here) before
++			// syncing; only the project lookups are checked.
++			var got []refKey
++			for _, k := range store.recorded() {
++				if !strings.HasSuffix(k.project, "manifest.git") {
++					got = append(got, k)
++				}
++			}
++			require.Equal(tt.want, got)
+ 		})
+ 	}
+ }
+diff --git a/gitpusher/repowatcher_test.go b/gitpusher/repowatcher_test.go
+index f109301..9a8c2e0 100644
+--- a/gitpusher/repowatcher_test.go
++++ b/gitpusher/repowatcher_test.go
+@@ -288,6 +288,8 @@ func TestRepoWatcher_StatDuringList(t *testing.T) {
+ 	cancel()
+ 	<-done
+ 	require.NotEmpty(t, m.Stat().LastError)
++}
++
+ type testContentorRemotesWithPath struct {
+ }
+ 
+diff --git a/ninjago/abfs.go b/ninjago/abfs.go
+index dc3bb44..a5e4ab6 100644
+--- a/ninjago/abfs.go
++++ b/ninjago/abfs.go
+@@ -548,7 +548,7 @@ func (c *ABFSBackend) applyIfCached(ctx context.Context, eval *Eval, delayed boo
+ 	}()
+ 
+ 	// A phony_output step runs on every build, so it is never looked up or recorded.
+-	if c.config.EvalNoCache || eval.step.IsPhonyOutput() {
++	if c.config.EvalNoCache || stepIsPhonyOutput(eval.step) {
+ 		return false, nil
+ 	}
+ 
+@@ -972,7 +972,7 @@ func (c *ABFSBackend) execTapLocal(ctx context.Context, eval *Eval) (*binding.Ev
+ 		ChrootToStrip: c.chroot,
+ 	})
+ 
+-	if err := c.recordResults(ctx, eval, resp, tapResult.ExitCode == 0 && !eval.step.IsPhonyOutput()); err != nil {
++	if err := c.recordResults(ctx, eval, resp, tapResult.ExitCode == 0 && !stepIsPhonyOutput(eval.step)); err != nil {
+ 		return resp, err
+ 	}
+ 
+@@ -1026,13 +1026,22 @@ func (c *ABFSBackend) recordResults(ctx context.Context, eval *Eval, resp *bindi
+ 		return err
+ 	}
+ 	if addMap {
+-		if err := c.store.AddMapResult(ctx, eval.req.Hash, resp.Hash); err != nil {
+-			fmt.Fprintf(os.Stderr, "failed to add map entry for %s req=%s resp=%s: %v\n", eval.step, eval.req.Hash, resp.Hash, err)
+-		}
++		c.addMapResult(ctx, eval, resp)
+ 	}
+ 	return nil
+ }
+ 
++// addMapResult records resp as a result of eval's request. A phony_output step runs on every
++// build, so its result is not recorded.
++func (c *ABFSBackend) addMapResult(ctx context.Context, eval *Eval, resp *binding.EvalResponse) {
++	if stepIsPhonyOutput(eval.step) {
++		return
++	}
++	if err := c.store.AddMapResult(ctx, eval.req.Hash, resp.Hash); err != nil {
++		fmt.Fprintf(os.Stderr, "failed to add map entry for %s req=%s resp=%s: %v\n", eval.step, eval.req.Hash, resp.Hash, err)
++	}
++}
++
+ // shouldIgnoreInput will hide the input from the eval request (which will break remote execution if it is actually required).
+ // Care should be taken before adding something here. See ignoreMatch() in match.go for a lighter weight check on the eval response
+ // matching part of the flow.
+@@ -1296,9 +1305,14 @@ func (c *ABFSBackend) Close() error {
+ 	return err
+ }
+ 
+-
+ // isPhonyNode reports whether the outputs of n are not files: a phony build, or a build with
+ // phony_output set on it or on its rule. Kati writes a .PHONY target with a recipe that way.
+ func isPhonyNode(n *graph.Node) bool {
+ 	return n.Build.Rule.IsPhony() || n.Build.Scope.ExpandField("phony_output") != ""
+ }
++
++// stepIsPhonyOutput reports whether s declares phony_output. It tolerates a step without a
++// build edge, as constructed by unit tests.
++func stepIsPhonyOutput(s *build.Step) bool {
++	return s != nil && s.Node != nil && s.Node.Build != nil && s.Node.Build.Scope != nil && s.IsPhonyOutput()
++}
+diff --git a/shared/cmd/cliexec.go b/shared/cmd/cliexec.go
+index 654f3d0..e0d8eae 100644
+--- a/shared/cmd/cliexec.go
++++ b/shared/cmd/cliexec.go
+@@ -157,12 +157,20 @@ func (c *CliExec) signalWrap(ctx context.Context, f func(ctx context.Context) er
+ 		// On the first Interrupt (Ctrl+C) try a clean exit
+ 		select {
+ 		case sig := <-sigChan:
+-			log.Println("Received a shutdown signal, attempting to cleanly exit...")
++			log.Printf("Received a shutdown signal (%s), attempting to cleanly exit...", unix.SignalName(sig.(syscall.Signal)))
+ 			go func() {
+-				// On the second Interrupt (Ctrl+C) try os.Exit()
+-				<-sigChan
+-				fmt.Fprintf(os.Stderr, "Process didn't exit, trying to exit forcefully\n")
+-				os.Exit(1)
++				// On the second Interrupt (Ctrl+C) try os.Exit(). Process managers
++				// escalate with SIGKILL, not with another SIGTERM, so a repeated
++				// SIGTERM must not cut the clean exit short.
++				for sig := range sigChan {
++					name := unix.SignalName(sig.(syscall.Signal))
++					if sig == syscall.SIGTERM {
++						log.Printf("Received another shutdown signal (%s), still exiting cleanly", name)
++						continue
++					}
++					fmt.Fprintf(os.Stderr, "Process didn't exit, trying to exit forcefully after %s\n", name)
++					os.Exit(1)
++				}
+ 			}()
+ 			received.Store(int32(sig.(syscall.Signal)))
+ 			cancel()
